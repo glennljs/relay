@@ -11,12 +11,17 @@ const ticketFilterSchema = z.object({
   priority: z.enum(ticketPriorities).optional(),
   sort: z.enum(ticketSortOptions).optional(),
   label: z.coerce.number().int().positive().optional(),
-  q: z.string().trim().min(1).optional()
+  q: z.string().trim().min(1).optional(),
+  project: z.string().trim().min(1).max(80).optional()
 });
 
 const publicTicketFilterSchema = ticketFilterSchema.extend({
   source: z.string().trim().min(1).max(80).optional(),
   externalRef: z.string().trim().min(1).max(200).optional()
+});
+
+const ticketGuardSchema = z.object({
+  project: z.string().trim().min(1).max(80).optional()
 });
 
 const idParamSchema = z.object({
@@ -28,6 +33,11 @@ const labelInputSchema = z.object({
   color: z.string().regex(/^#([0-9a-fA-F]{6})$/)
 });
 
+const projectInputSchema = z.object({
+  name: z.string().trim().min(1).max(80),
+  slug: z.string().trim().min(1).max(80).optional()
+});
+
 const ticketInputSchema = z.object({
   title: z.string().trim().min(1).max(140),
   description: z.string().trim().max(5000).default(""),
@@ -36,7 +46,20 @@ const ticketInputSchema = z.object({
   labelIds: z.array(z.number().int().positive()).default([])
 });
 
+const appTicketCreateSchema = ticketInputSchema.extend({
+  project: z.string().trim().min(1).max(80).optional()
+});
+
+const ticketPatchSchema = z.object({
+  title: z.string().trim().min(1).max(140).optional(),
+  description: z.string().trim().max(5000).optional(),
+  status: z.enum(ticketStatuses).optional(),
+  priority: z.enum(ticketPriorities).optional(),
+  labelIds: z.array(z.number().int().positive()).optional()
+});
+
 const publicTicketCreateSchema = z.object({
+  project: z.string().trim().min(1).max(80),
   title: z.string().trim().min(1).max(140),
   description: z.string().trim().max(5000).default(""),
   status: z.enum(ticketStatuses).default("backlog"),
@@ -64,6 +87,11 @@ const publicTicketNoteSchema = z.object({
   authorType: z.enum(ticketActorTypes).default("agent")
 });
 
+const appTicketNoteSchema = publicTicketNoteSchema.extend({
+  authorName: z.string().trim().min(1).max(80).default("Local user"),
+  authorType: z.enum(ticketActorTypes).default("user")
+});
+
 function createPublicOpenApiDocument() {
   return {
     openapi: "3.1.0",
@@ -73,10 +101,16 @@ function createPublicOpenApiDocument() {
       description: "API for agents to create, update, search, annotate, and delete tickets."
     },
     paths: {
+      "/api/public/v1/projects": {
+        get: {
+          summary: "List projects"
+        }
+      },
       "/api/public/v1/tickets": {
         get: {
           summary: "List tickets",
           parameters: [
+            { name: "project", in: "query", schema: { type: "string" } },
             { name: "status", in: "query", schema: { type: "string", enum: ticketStatuses } },
             { name: "priority", in: "query", schema: { type: "string", enum: ticketPriorities } },
             { name: "sort", in: "query", schema: { type: "string", enum: ticketSortOptions } },
@@ -101,11 +135,17 @@ function createPublicOpenApiDocument() {
       "/api/public/v1/tickets/{id}": {
         get: {
           summary: "Fetch a ticket with notes",
-          parameters: [{ name: "id", in: "path", required: true, schema: { type: "integer" } }]
+          parameters: [
+            { name: "id", in: "path", required: true, schema: { type: "integer" } },
+            { name: "project", in: "query", schema: { type: "string" } }
+          ]
         },
         patch: {
           summary: "Update a ticket or append an agent note",
-          parameters: [{ name: "id", in: "path", required: true, schema: { type: "integer" } }],
+          parameters: [
+            { name: "id", in: "path", required: true, schema: { type: "integer" } },
+            { name: "project", in: "query", schema: { type: "string" } }
+          ],
           requestBody: {
             required: true,
             content: {
@@ -117,13 +157,19 @@ function createPublicOpenApiDocument() {
         },
         delete: {
           summary: "Delete a ticket",
-          parameters: [{ name: "id", in: "path", required: true, schema: { type: "integer" } }]
+          parameters: [
+            { name: "id", in: "path", required: true, schema: { type: "integer" } },
+            { name: "project", in: "query", schema: { type: "string" } }
+          ]
         }
       },
       "/api/public/v1/tickets/{id}/notes": {
         post: {
           summary: "Append a note to a ticket",
-          parameters: [{ name: "id", in: "path", required: true, schema: { type: "integer" } }],
+          parameters: [
+            { name: "id", in: "path", required: true, schema: { type: "integer" } },
+            { name: "project", in: "query", schema: { type: "string" } }
+          ],
           requestBody: {
             required: true,
             content: {
@@ -139,8 +185,9 @@ function createPublicOpenApiDocument() {
       schemas: {
         PublicTicketCreate: {
           type: "object",
-          required: ["title"],
+          required: ["project", "title"],
           properties: {
+            project: { type: "string" },
             title: { type: "string" },
             description: { type: "string" },
             status: { type: "string", enum: ticketStatuses },
@@ -188,8 +235,33 @@ export function createApp(options: AppOptions) {
   const repository = createRepository(db);
   const app = express();
 
+  function hasProject(projectSlug: string | undefined) {
+    return !projectSlug || repository.getProjectBySlug(projectSlug) !== null;
+  }
+
   app.use(cors());
   app.use(express.json());
+
+  app.get("/api/projects", (_request, response) => {
+    response.json(repository.listProjects());
+  });
+
+  app.post("/api/projects", (request, response) => {
+    const project = repository.createProject(projectInputSchema.parse(request.body));
+    response.status(201).json(project);
+  });
+
+  app.patch("/api/projects/:id", (request, response) => {
+    const { id } = idParamSchema.parse(request.params);
+    const project = repository.updateProject(id, projectInputSchema.parse(request.body));
+
+    if (!project) {
+      response.status(404).json({ message: "Project not found." });
+      return;
+    }
+
+    response.json(project);
+  });
 
   app.get("/api/labels", (_request, response) => {
     response.json(repository.listLabels());
@@ -226,12 +298,19 @@ export function createApp(options: AppOptions) {
 
   app.get("/api/tickets", (request, response) => {
     const filters = ticketFilterSchema.parse(request.query);
+
+    if (!hasProject(filters.project)) {
+      response.status(400).json({ message: "Project not found." });
+      return;
+    }
+
     response.json(repository.listTickets(filters));
   });
 
   app.get("/api/tickets/:id", (request, response) => {
     const { id } = idParamSchema.parse(request.params);
-    const ticket = repository.getTicket(id);
+    const { project } = ticketGuardSchema.parse(request.query);
+    const ticket = repository.getTicketDetail(id, { project });
 
     if (!ticket) {
       response.status(404).json({ message: "Ticket not found." });
@@ -242,25 +321,59 @@ export function createApp(options: AppOptions) {
   });
 
   app.post("/api/tickets", (request, response) => {
-    const ticket = repository.createTicket(ticketInputSchema.parse(request.body));
+    const payload = appTicketCreateSchema.parse(request.body);
+
+    if (!hasProject(payload.project)) {
+      response.status(400).json({ message: "Project not found." });
+      return;
+    }
+
+    const created = repository.createTicket(
+      {
+        title: payload.title,
+        description: payload.description,
+        status: payload.status,
+        priority: payload.priority,
+        labelIds: payload.labelIds
+      },
+      { project: payload.project }
+    );
+    const ticket = repository.getTicketDetail(created.id)!;
     response.status(201).json(ticket);
   });
 
   app.patch("/api/tickets/:id", (request, response) => {
     const { id } = idParamSchema.parse(request.params);
-    const ticket = repository.updateTicket(id, ticketInputSchema.parse(request.body));
+    const { project } = ticketGuardSchema.parse(request.query);
+    const payload = ticketPatchSchema.parse(request.body);
+    const hasTicketChanges =
+      payload.title !== undefined ||
+      payload.description !== undefined ||
+      payload.status !== undefined ||
+      payload.priority !== undefined ||
+      payload.labelIds !== undefined;
 
-    if (!ticket) {
+    if (!hasTicketChanges) {
+      response.status(400).json({
+        message: "Provide at least one ticket field to update."
+      });
+      return;
+    }
+
+    const updated = repository.patchTicket(id, payload, { project });
+
+    if (!updated) {
       response.status(404).json({ message: "Ticket not found." });
       return;
     }
 
-    response.json(ticket);
+    response.json(repository.getTicketDetail(id, { project }));
   });
 
   app.delete("/api/tickets/:id", (request, response) => {
     const { id } = idParamSchema.parse(request.params);
-    const deleted = repository.deleteTicket(id);
+    const { project } = ticketGuardSchema.parse(request.query);
+    const deleted = repository.deleteTicket(id, { project });
 
     if (!deleted) {
       response.status(404).json({ message: "Ticket not found." });
@@ -270,20 +383,44 @@ export function createApp(options: AppOptions) {
     response.status(204).end();
   });
 
+  app.post("/api/tickets/:id/notes", (request, response) => {
+    const { id } = idParamSchema.parse(request.params);
+    const { project } = ticketGuardSchema.parse(request.query);
+    const note = repository.createTicketNote(id, appTicketNoteSchema.parse(request.body), { project });
+
+    if (!note) {
+      response.status(404).json({ message: "Ticket not found." });
+      return;
+    }
+
+    response.status(201).json(note);
+  });
+
   const publicApi = express.Router();
 
   publicApi.get("/openapi.json", (_request, response) => {
     response.json(createPublicOpenApiDocument());
   });
 
+  publicApi.get("/projects", (_request, response) => {
+    response.json(repository.listProjects());
+  });
+
   publicApi.get("/tickets", (request, response) => {
     const filters = publicTicketFilterSchema.parse(request.query);
+
+    if (!hasProject(filters.project)) {
+      response.status(400).json({ message: "Project not found." });
+      return;
+    }
+
     response.json(repository.listTickets(filters));
   });
 
   publicApi.get("/tickets/:id", (request, response) => {
     const { id } = idParamSchema.parse(request.params);
-    const ticket = repository.getTicketDetail(id);
+    const { project } = ticketGuardSchema.parse(request.query);
+    const ticket = repository.getTicketDetail(id, { project });
 
     if (!ticket) {
       response.status(404).json({ message: "Ticket not found." });
@@ -295,6 +432,12 @@ export function createApp(options: AppOptions) {
 
   publicApi.post("/tickets", (request, response) => {
     const payload = publicTicketCreateSchema.parse(request.body);
+
+    if (!hasProject(payload.project)) {
+      response.status(400).json({ message: "Project not found." });
+      return;
+    }
+
     const result = repository.createOrGetTicketByExternalRef(
       {
         title: payload.title,
@@ -304,20 +447,25 @@ export function createApp(options: AppOptions) {
         labelIds: payload.labelIds
       },
       {
+        project: payload.project,
         source: payload.source,
         externalRef: payload.externalRef
       }
     );
 
     if (payload.note && result.created) {
-      repository.createTicketNote(result.ticket.id, {
-        body: payload.note,
-        authorName: payload.actorName,
-        authorType: "agent"
-      });
+      repository.createTicketNote(
+        result.ticket.id,
+        {
+          body: payload.note,
+          authorName: payload.actorName,
+          authorType: "agent"
+        },
+        { project: payload.project }
+      );
     }
 
-    const ticket = repository.getTicketDetail(result.ticket.id)!;
+    const ticket = repository.getTicketDetail(result.ticket.id, { project: payload.project })!;
     response.status(result.created ? 201 : 200).json({
       created: result.created,
       ticket
@@ -326,6 +474,7 @@ export function createApp(options: AppOptions) {
 
   publicApi.patch("/tickets/:id", (request, response) => {
     const { id } = idParamSchema.parse(request.params);
+    const { project } = ticketGuardSchema.parse(request.query);
     const payload = publicTicketPatchSchema.parse(request.body);
     const hasTicketChanges =
       payload.title !== undefined ||
@@ -342,37 +491,51 @@ export function createApp(options: AppOptions) {
     }
 
     if (hasTicketChanges) {
-      const updated = repository.patchTicket(id, {
-        title: payload.title,
-        description: payload.description,
-        status: payload.status,
-        priority: payload.priority,
-        labelIds: payload.labelIds
-      });
+      const updated = repository.patchTicket(
+        id,
+        {
+          title: payload.title,
+          description: payload.description,
+          status: payload.status,
+          priority: payload.priority,
+          labelIds: payload.labelIds
+        },
+        { project }
+      );
 
       if (!updated) {
         response.status(404).json({ message: "Ticket not found." });
         return;
       }
-    } else if (!repository.getTicket(id)) {
+    } else if (!repository.getTicket(id, { project })) {
       response.status(404).json({ message: "Ticket not found." });
       return;
     }
 
     if (payload.note) {
-      repository.createTicketNote(id, {
-        body: payload.note,
-        authorName: payload.actorName,
-        authorType: "agent"
-      });
+      const note = repository.createTicketNote(
+        id,
+        {
+          body: payload.note,
+          authorName: payload.actorName,
+          authorType: "agent"
+        },
+        { project }
+      );
+
+      if (!note) {
+        response.status(404).json({ message: "Ticket not found." });
+        return;
+      }
     }
 
-    response.json(repository.getTicketDetail(id));
+    response.json(repository.getTicketDetail(id, { project }));
   });
 
   publicApi.delete("/tickets/:id", (request, response) => {
     const { id } = idParamSchema.parse(request.params);
-    const deleted = repository.deleteTicket(id);
+    const { project } = ticketGuardSchema.parse(request.query);
+    const deleted = repository.deleteTicket(id, { project });
 
     if (!deleted) {
       response.status(404).json({ message: "Ticket not found." });
@@ -384,7 +547,10 @@ export function createApp(options: AppOptions) {
 
   publicApi.post("/tickets/:id/notes", (request, response) => {
     const { id } = idParamSchema.parse(request.params);
-    const note = repository.createTicketNote(id, publicTicketNoteSchema.parse(request.body));
+    const { project } = ticketGuardSchema.parse(request.query);
+    const note = repository.createTicketNote(id, publicTicketNoteSchema.parse(request.body), {
+      project
+    });
 
     if (!note) {
       response.status(404).json({ message: "Ticket not found." });
@@ -412,7 +578,10 @@ export function createApp(options: AppOptions) {
       return;
     }
 
-    if (error instanceof Error && error.message.includes("labels")) {
+    if (
+      error instanceof Error &&
+      (error.message.includes("labels") || error.message.includes("Project"))
+    ) {
       response.status(400).json({ message: error.message });
       return;
     }

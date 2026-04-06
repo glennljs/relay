@@ -1,4 +1,16 @@
-import type { Label, LabelInput, Ticket, TicketInput, TicketQuery, TicketSummary } from "../shared/types";
+import type {
+  Label,
+  LabelInput,
+  Project,
+  ProjectInput,
+  TicketDetail,
+  TicketInput,
+  TicketPatchInput,
+  TicketNote,
+  TicketNoteInput,
+  TicketQuery,
+  TicketSummary
+} from "../shared/types";
 
 async function request<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
   const response = await fetch(input, {
@@ -26,6 +38,9 @@ async function request<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
 function createQueryString(query: TicketQuery) {
   const params = new URLSearchParams();
 
+  if (query.project) {
+    params.set("project", query.project);
+  }
   if (query.status) {
     params.set("status", query.status);
   }
@@ -44,6 +59,33 @@ function createQueryString(query: TicketQuery) {
 
   const value = params.toString();
   return value ? `?${value}` : "";
+}
+
+function createProjectGuard(project?: string) {
+  if (!project) {
+    return "";
+  }
+
+  const params = new URLSearchParams({ project });
+  return `?${params.toString()}`;
+}
+
+export function fetchProjects() {
+  return request<Project[]>("/api/projects");
+}
+
+export function createProject(input: ProjectInput) {
+  return request<Project>("/api/projects", {
+    method: "POST",
+    body: JSON.stringify(input)
+  });
+}
+
+export function updateProject(id: number, input: ProjectInput) {
+  return request<Project>(`/api/projects/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(input)
+  });
 }
 
 export function fetchLabels() {
@@ -74,26 +116,33 @@ export function fetchTickets(query: TicketQuery) {
   return request<TicketSummary[]>(`/api/tickets${createQueryString(query)}`);
 }
 
-export function fetchTicket(id: number) {
-  return request<Ticket>(`/api/tickets/${id}`);
+export function fetchTicket(id: number, project?: string) {
+  return request<TicketDetail>(`/api/tickets/${id}${createProjectGuard(project)}`);
 }
 
-export function createTicket(input: TicketInput) {
-  return request<Ticket>("/api/tickets", {
+export function createTicket(input: TicketInput & { project: string }) {
+  return request<TicketDetail>("/api/tickets", {
     method: "POST",
     body: JSON.stringify(input)
   });
 }
 
-export function updateTicket(id: number, input: TicketInput) {
-  return request<Ticket>(`/api/tickets/${id}`, {
+export function updateTicket(id: number, input: TicketPatchInput, project?: string) {
+  return request<TicketDetail>(`/api/tickets/${id}${createProjectGuard(project)}`, {
     method: "PATCH",
     body: JSON.stringify(input)
   });
 }
 
-export function deleteTicket(id: number) {
-  return request<void>(`/api/tickets/${id}`, {
+export function deleteTicket(id: number, project?: string) {
+  return request<void>(`/api/tickets/${id}${createProjectGuard(project)}`, {
     method: "DELETE"
+  });
+}
+
+export function createTicketNote(id: number, input: TicketNoteInput, project?: string) {
+  return request<TicketNote>(`/api/tickets/${id}/notes${createProjectGuard(project)}`, {
+    method: "POST",
+    body: JSON.stringify(input)
   });
 }

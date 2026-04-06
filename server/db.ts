@@ -8,6 +8,8 @@ import {
   ticketStatuses,
   type Label,
   type LabelInput,
+  type Project,
+  type ProjectInput,
   type Ticket,
   type TicketActorType,
   type TicketDetail,
@@ -20,9 +22,18 @@ import {
   type TicketSummary
 } from "../shared/types.js";
 
+const DEFAULT_PROJECT_NAME = "Default Project";
+const DEFAULT_PROJECT_SLUG = "default";
+const TICKET_NUMBER_PREFIX = "APP";
+
 const labelInputSchema = z.object({
   name: z.string().trim().min(1).max(40),
   color: z.string().regex(/^#([0-9a-fA-F]{6})$/)
+});
+
+const projectInputSchema = z.object({
+  name: z.string().trim().min(1).max(80),
+  slug: z.string().trim().min(1).max(80).optional()
 });
 
 const ticketInputSchema = z.object({
@@ -47,6 +58,14 @@ const defaultLabels: Array<Omit<Label, "id">> = [
 
 type SQLiteDatabase = InstanceType<typeof Database>;
 
+interface ProjectRow {
+  id: number;
+  name: string;
+  slug: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 interface TicketRow {
   id: number;
   ticketNumber: string;
@@ -58,6 +77,9 @@ interface TicketRow {
   externalRef?: string | null;
   createdAt: string;
   updatedAt: string;
+  projectId: number;
+  projectSlug: string;
+  projectName: string;
   labelIds: string;
 }
 
@@ -81,6 +103,16 @@ function toLabelIds(value: string): number[] {
     .map((item) => Number(item));
 }
 
+function mapProject(row: ProjectRow): Project {
+  return {
+    id: row.id,
+    name: row.name,
+    slug: row.slug,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt
+  };
+}
+
 function mapTicketSummary(row: TicketRow): TicketSummary {
   return {
     id: row.id,
@@ -90,6 +122,9 @@ function mapTicketSummary(row: TicketRow): TicketSummary {
     priority: row.priority,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
+    projectId: row.projectId,
+    projectSlug: row.projectSlug,
+    projectName: row.projectName,
     labelIds: toLabelIds(row.labelIds)
   };
 }
@@ -119,6 +154,15 @@ function mapTicketDetail(row: TicketRow, notes: TicketNote[]): TicketDetail {
     externalRef: row.externalRef ?? null,
     notes
   };
+}
+
+function slugifyProjectName(value: string) {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .replace(/-{2,}/g, "-");
 }
 
 function getTicketOrderByClause(sort: TicketSortOption | undefined) {
@@ -157,9 +201,18 @@ function createSchema(db: SQLiteDatabase) {
   db.exec(`
     PRAGMA foreign_keys = ON;
 
+    CREATE TABLE IF NOT EXISTS projects (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      slug TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
     CREATE TABLE IF NOT EXISTS tickets (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      ticket_number TEXT UNIQUE,
+      project_id INTEGER NOT NULL,
+      ticket_number TEXT NOT NULL,
       title TEXT NOT NULL,
       description TEXT NOT NULL DEFAULT '',
       source TEXT NOT NULL DEFAULT 'app',
@@ -167,7 +220,15 @@ function createSchema(db: SQLiteDatabase) {
       status TEXT NOT NULL CHECK (status IN ('backlog', 'todo', 'in_progress', 'done', 'canceled')),
       priority TEXT NOT NULL CHECK (priority IN ('none', 'low', 'medium', 'high', 'urgent')),
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE RESTRICT,
+      UNIQUE (project_id, ticket_number)
+    );
+
+    CREATE TABLE IF NOT EXISTS project_ticket_sequences (
+      project_id INTEGER PRIMARY KEY,
+      next_ticket_number INTEGER NOT NULL DEFAULT 1,
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS labels (
@@ -196,17 +257,190 @@ function createSchema(db: SQLiteDatabase) {
   `);
 }
 
+function ensureDefaultProject(db: SQLiteDatabase) {
+  const existing = db
+    .prepare("SELECT id FROM projects WHERE slug = ?")
+    .get(DEFAULT_PROJECT_SLUG) as { id: number } | undefined;
+
+  if (existing) {
+    db.prepare(`
+      INSERT OR IGNORE INTO project_ticket_sequences (project_id, next_ticket_number)
+      VALUES (?, 1)
+    `).run(existing.id);
+    return existing.id;
+  }
+
+  const createdAt = nowTimestamp();
+  const result = db
+    .prepare(
+      `
+        INSERT INTO projects (name, slug, created_at, updated_at)
+        VALUES (?, ?, ?, ?)
+      `
+    )
+    .run(DEFAULT_PROJECT_NAME, DEFAULT_PROJECT_SLUG, createdAt, createdAt);
+
+  const projectId = Number(result.lastInsertRowid);
+  db.prepare(`
+    INSERT OR IGNORE INTO project_ticket_sequences (project_id, next_ticket_number)
+    VALUES (?, 1)
+  `).run(projectId);
+
+  return projectId;
+}
+
+function ticketTableUsesGlobalTicketNumberConstraint(sql: string | null) {
+  return Boolean(sql?.match(/ticket_number\s+TEXT\s+UNIQUE/i));
+}
+
+function rebuildTicketTable(
+  db: SQLiteDatabase,
+  defaultProjectId: number,
+  options: { hasProjectId: boolean; hasSource: boolean; hasExternalRef: boolean }
+) {
+  const restoreForeignKeys = () => db.pragma("foreign_keys = ON");
+  db.pragma("foreign_keys = OFF");
+
+  const projectIdExpression = options.hasProjectId ? "COALESCE(project_id, ?)" : "?";
+  const sourceExpression = options.hasSource ? "COALESCE(source, 'app')" : "'app'";
+  const externalRefExpression = options.hasExternalRef ? "external_ref" : "NULL";
+
+  try {
+    db.exec(`
+      CREATE TABLE tickets_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL,
+        ticket_number TEXT NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        source TEXT NOT NULL DEFAULT 'app',
+        external_ref TEXT,
+        status TEXT NOT NULL CHECK (status IN ('backlog', 'todo', 'in_progress', 'done', 'canceled')),
+        priority TEXT NOT NULL CHECK (priority IN ('none', 'low', 'medium', 'high', 'urgent')),
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE RESTRICT,
+        UNIQUE (project_id, ticket_number)
+      );
+    `);
+
+    db.prepare(
+      `
+        INSERT INTO tickets_new (
+          id,
+          project_id,
+          ticket_number,
+          title,
+          description,
+          source,
+          external_ref,
+          status,
+          priority,
+          created_at,
+          updated_at
+        )
+        SELECT
+          id,
+          ${projectIdExpression},
+          ticket_number,
+          title,
+          description,
+          ${sourceExpression},
+          ${externalRefExpression},
+          status,
+          priority,
+          created_at,
+          updated_at
+        FROM tickets
+      `
+    ).run(defaultProjectId);
+
+    db.exec(`
+      DROP TABLE tickets;
+      ALTER TABLE tickets_new RENAME TO tickets;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_project_source_external_ref
+      ON tickets(project_id, source, external_ref)
+      WHERE external_ref IS NOT NULL AND project_id IS NOT NULL;
+    `);
+  } finally {
+    restoreForeignKeys();
+  }
+}
+
 function migrateSchema(db: SQLiteDatabase) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS projects (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      slug TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS project_ticket_sequences (
+      project_id INTEGER PRIMARY KEY,
+      next_ticket_number INTEGER NOT NULL DEFAULT 1,
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+    );
+  `);
+
+  const defaultProjectId = ensureDefaultProject(db);
   const columns = db.prepare("PRAGMA table_info(tickets)").all() as Array<{ name: string }>;
   const columnNames = new Set(columns.map((column) => column.name));
+  const ticketTableSql = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tickets'")
+    .get() as { sql: string | null } | undefined;
 
-  if (!columnNames.has("source")) {
+  const needsTicketTableRebuild =
+    ticketTableUsesGlobalTicketNumberConstraint(ticketTableSql?.sql ?? null) ||
+    !columnNames.has("project_id") ||
+    !columnNames.has("source") ||
+    !columnNames.has("external_ref");
+
+  if (needsTicketTableRebuild) {
+    rebuildTicketTable(db, defaultProjectId, {
+      hasProjectId: columnNames.has("project_id"),
+      hasSource: columnNames.has("source"),
+      hasExternalRef: columnNames.has("external_ref")
+    });
+  }
+
+  if (!needsTicketTableRebuild && !columnNames.has("source")) {
     db.exec("ALTER TABLE tickets ADD COLUMN source TEXT NOT NULL DEFAULT 'app'");
   }
 
-  if (!columnNames.has("external_ref")) {
+  if (!needsTicketTableRebuild && !columnNames.has("external_ref")) {
     db.exec("ALTER TABLE tickets ADD COLUMN external_ref TEXT");
   }
+
+  if (!needsTicketTableRebuild && !columnNames.has("project_id")) {
+    db.exec("ALTER TABLE tickets ADD COLUMN project_id INTEGER REFERENCES projects(id)");
+  }
+
+  db.prepare("UPDATE tickets SET project_id = ? WHERE project_id IS NULL").run(defaultProjectId);
+  db.exec(`
+    INSERT INTO project_ticket_sequences (project_id, next_ticket_number)
+    SELECT
+      p.id,
+      COALESCE(
+        (
+          SELECT MAX(CAST(SUBSTR(t.ticket_number, 5) AS INTEGER))
+          FROM tickets t
+          WHERE t.project_id = p.id
+            AND t.ticket_number LIKE '${TICKET_NUMBER_PREFIX}-%'
+        ),
+        0
+      ) + 1
+    FROM projects p
+    WHERE 1 = 1
+    ON CONFLICT(project_id) DO UPDATE SET
+      next_ticket_number = CASE
+        WHEN excluded.next_ticket_number > next_ticket_number THEN excluded.next_ticket_number
+        ELSE next_ticket_number
+      END
+  `);
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS ticket_notes (
@@ -219,9 +453,10 @@ function migrateSchema(db: SQLiteDatabase) {
       FOREIGN KEY (ticket_id) REFERENCES tickets(id) ON DELETE CASCADE
     );
 
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_source_external_ref
-    ON tickets(source, external_ref)
-    WHERE external_ref IS NOT NULL;
+    DROP INDEX IF EXISTS idx_tickets_source_external_ref;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_project_source_external_ref
+    ON tickets(project_id, source, external_ref)
+    WHERE external_ref IS NOT NULL AND project_id IS NOT NULL;
   `);
 }
 
@@ -262,11 +497,25 @@ export function initializeDatabase(dbPath: string) {
 }
 
 export function createRepository(db: SQLiteDatabase) {
-  const insertTicket = db.prepare(`
-    INSERT INTO tickets (title, description, source, external_ref, status, priority, created_at, updated_at)
-    VALUES (@title, @description, @source, @externalRef, @status, @priority, @createdAt, @updatedAt)
+  const insertProject = db.prepare(`
+    INSERT INTO projects (name, slug, created_at, updated_at)
+    VALUES (@name, @slug, @createdAt, @updatedAt)
   `);
-
+  const insertProjectTicketSequence = db.prepare(`
+    INSERT INTO project_ticket_sequences (project_id, next_ticket_number)
+    VALUES (@projectId, @nextTicketNumber)
+  `);
+  const updateProjectRecord = db.prepare(`
+    UPDATE projects
+    SET name = @name,
+        slug = @slug,
+        updated_at = @updatedAt
+    WHERE id = @id
+  `);
+  const insertTicket = db.prepare(`
+    INSERT INTO tickets (project_id, ticket_number, title, description, source, external_ref, status, priority, created_at, updated_at)
+    VALUES (@projectId, @ticketNumber, @title, @description, @source, @externalRef, @status, @priority, @createdAt, @updatedAt)
+  `);
   const updateTicketRecord = db.prepare(`
     UPDATE tickets
     SET title = @title,
@@ -276,10 +525,28 @@ export function createRepository(db: SQLiteDatabase) {
         updated_at = @updatedAt
     WHERE id = @id
   `);
-
-  const updateTicketNumber = db.prepare(
-    "UPDATE tickets SET ticket_number = ? WHERE id = ?"
-  );
+  const touchTicketRecord = db.prepare(`
+    UPDATE tickets
+    SET updated_at = ?
+    WHERE id = ?
+  `);
+  const reserveTicketNumber = db.prepare(`
+    UPDATE project_ticket_sequences
+    SET next_ticket_number = next_ticket_number + 1
+    WHERE project_id = ?
+    RETURNING next_ticket_number - 1 AS ticketNumber
+  `);
+  const initializeTicketSequence = db.prepare(`
+    INSERT INTO project_ticket_sequences (project_id, next_ticket_number)
+    SELECT ?, COALESCE(MAX(CAST(SUBSTR(ticket_number, 5) AS INTEGER)), 0) + 1
+    FROM tickets
+    WHERE project_id = ?
+    ON CONFLICT(project_id) DO UPDATE SET
+      next_ticket_number = CASE
+        WHEN excluded.next_ticket_number > next_ticket_number THEN excluded.next_ticket_number
+        ELSE next_ticket_number
+      END
+  `);
   const insertTicketNote = db.prepare(`
     INSERT INTO ticket_notes (ticket_id, body, author_name, author_type, created_at)
     VALUES (@ticketId, @body, @authorName, @authorType, @createdAt)
@@ -295,6 +562,71 @@ export function createRepository(db: SQLiteDatabase) {
       insertTicketLabel.run(ticketId, labelId);
     }
   });
+
+  function getProjectRowBySlug(slug: string) {
+    return db
+      .prepare(
+        `
+          SELECT
+            id,
+            name,
+            slug,
+            created_at AS createdAt,
+            updated_at AS updatedAt
+          FROM projects
+          WHERE slug = ?
+        `
+      )
+      .get(slug) as ProjectRow | undefined;
+  }
+
+  function getProjectRowById(id: number) {
+    return db
+      .prepare(
+        `
+          SELECT
+            id,
+            name,
+            slug,
+            created_at AS createdAt,
+            updated_at AS updatedAt
+          FROM projects
+          WHERE id = ?
+        `
+      )
+      .get(id) as ProjectRow | undefined;
+  }
+
+  function getDefaultProject() {
+    const project = getProjectRowBySlug(DEFAULT_PROJECT_SLUG);
+    if (!project) {
+      throw new Error("Project not found.");
+    }
+
+    return mapProject(project);
+  }
+
+  function requireProject(projectSlug?: string) {
+    if (!projectSlug) {
+      return getDefaultProject();
+    }
+
+    const project = getProjectRowBySlug(projectSlug);
+    if (!project) {
+      throw new Error("Project not found.");
+    }
+
+    return mapProject(project);
+  }
+
+  function resolveProjectGuard(projectSlug?: string) {
+    if (!projectSlug) {
+      return null;
+    }
+
+    const project = getProjectRowBySlug(projectSlug);
+    return project ? mapProject(project) : null;
+  }
 
   function assertLabelIdsExist(labelIds: number[]) {
     if (labelIds.length === 0) {
@@ -315,24 +647,175 @@ export function createRepository(db: SQLiteDatabase) {
     const rows = db
       .prepare(
         `
-        SELECT
-          id,
-          ticket_id AS ticketId,
-          body,
-          author_name AS authorName,
-          author_type AS authorType,
-          created_at AS createdAt
-        FROM ticket_notes
-        WHERE ticket_id = ?
-        ORDER BY created_at ASC, id ASC
-      `
+          SELECT
+            id,
+            ticket_id AS ticketId,
+            body,
+            author_name AS authorName,
+            author_type AS authorType,
+            created_at AS createdAt
+          FROM ticket_notes
+          WHERE ticket_id = ?
+          ORDER BY created_at ASC, id ASC
+        `
       )
       .all(ticketId) as TicketNoteRow[];
 
     return rows.map(mapTicketNote);
   }
 
+  function getTicketRow(id: number, projectSlug?: string) {
+    const conditions = ["t.id = ?"];
+    const params: Array<number | string> = [id];
+
+    if (projectSlug) {
+      conditions.push("p.slug = ?");
+      params.push(projectSlug);
+    }
+
+    return db
+      .prepare(
+        `
+          SELECT
+            t.id,
+            t.ticket_number AS ticketNumber,
+            t.title,
+            t.description,
+            t.source,
+            t.external_ref AS externalRef,
+            t.status,
+            t.priority,
+            t.created_at AS createdAt,
+            t.updated_at AS updatedAt,
+            p.id AS projectId,
+            p.slug AS projectSlug,
+            p.name AS projectName,
+            COALESCE(group_concat(tl.label_id), '') AS labelIds
+          FROM tickets t
+          INNER JOIN projects p ON p.id = t.project_id
+          LEFT JOIN ticket_labels tl ON tl.ticket_id = t.id
+          WHERE ${conditions.join(" AND ")}
+          GROUP BY t.id
+        `
+      )
+      .get(...params) as TicketRow | undefined;
+  }
+
   return {
+    listProjects(): Project[] {
+      const rows = db
+        .prepare(
+          `
+            SELECT
+              id,
+              name,
+              slug,
+              created_at AS createdAt,
+              updated_at AS updatedAt
+            FROM projects
+            ORDER BY name COLLATE NOCASE ASC, id ASC
+          `
+        )
+        .all() as ProjectRow[];
+
+      return rows.map(mapProject);
+    },
+
+    getProjectBySlug(slug: string): Project | null {
+      const row = getProjectRowBySlug(slug);
+      return row ? mapProject(row) : null;
+    },
+
+    createProject(input: ProjectInput): Project {
+      const parsed = projectInputSchema.parse(input);
+      const slug = slugifyProjectName(parsed.slug ?? parsed.name);
+
+      if (!slug) {
+        throw new Error("Project slug cannot be empty.");
+      }
+
+      const createdAt = nowTimestamp();
+      const createProjectRecord = db.transaction(() => {
+        const result = insertProject.run({
+          name: parsed.name,
+          slug,
+          createdAt,
+          updatedAt: createdAt
+        });
+
+        insertProjectTicketSequence.run({
+          projectId: Number(result.lastInsertRowid),
+          nextTicketNumber: 1
+        });
+
+        return db
+          .prepare(
+            `
+              SELECT
+                id,
+                name,
+                slug,
+                created_at AS createdAt,
+                updated_at AS updatedAt
+              FROM projects
+              WHERE id = ?
+            `
+          )
+          .get(result.lastInsertRowid) as Project;
+      });
+
+      try {
+        return createProjectRecord();
+      } catch (error) {
+        if (error instanceof Error && error.message.includes("projects.slug")) {
+          throw new Error("Project slug already exists.");
+        }
+
+        throw error;
+      }
+    },
+
+    updateProject(id: number, input: ProjectInput): Project | null {
+      const current = getProjectRowById(id);
+
+      if (!current) {
+        return null;
+      }
+
+      const parsed = projectInputSchema.parse(input);
+      const requestedSlug = parsed.slug ? slugifyProjectName(parsed.slug) : undefined;
+
+      if (current.slug === DEFAULT_PROJECT_SLUG && requestedSlug && requestedSlug !== DEFAULT_PROJECT_SLUG) {
+        throw new Error("Default project slug cannot be changed.");
+      }
+
+      const slug =
+        current.slug === DEFAULT_PROJECT_SLUG
+          ? DEFAULT_PROJECT_SLUG
+          : slugifyProjectName(parsed.slug ?? parsed.name);
+
+      if (!slug) {
+        throw new Error("Project slug cannot be empty.");
+      }
+
+      try {
+        updateProjectRecord.run({
+          id,
+          name: parsed.name,
+          slug,
+          updatedAt: nowTimestamp()
+        });
+
+        return mapProject(getProjectRowById(id)!);
+      } catch (error) {
+        if (error instanceof Error && error.message.includes("projects.slug")) {
+          throw new Error("Project slug already exists.");
+        }
+
+        throw error;
+      }
+    },
+
     listLabels(): Label[] {
       return db
         .prepare("SELECT id, name, color FROM labels ORDER BY name COLLATE NOCASE ASC")
@@ -372,6 +855,16 @@ export function createRepository(db: SQLiteDatabase) {
       const conditions: string[] = [];
       const params: unknown[] = [];
 
+      if (query.project) {
+        const project = this.getProjectBySlug(query.project);
+        if (!project) {
+          throw new Error("Project not found.");
+        }
+
+        conditions.push("p.slug = ?");
+        params.push(query.project);
+      }
+
       if (query.status) {
         conditions.push("t.status = ?");
         params.push(query.status);
@@ -410,93 +903,63 @@ export function createRepository(db: SQLiteDatabase) {
       const rows = db
         .prepare(
           `
-          SELECT
-            t.id,
-            t.ticket_number AS ticketNumber,
-            t.title,
-            t.status,
-            t.priority,
-            t.created_at AS createdAt,
-            t.updated_at AS updatedAt,
-            COALESCE(group_concat(tl.label_id), '') AS labelIds
-          FROM tickets t
-          LEFT JOIN ticket_labels tl ON tl.ticket_id = t.id
-          ${whereClause}
-          GROUP BY t.id
-          ORDER BY ${orderByClause}
-        `
+            SELECT
+              t.id,
+              t.ticket_number AS ticketNumber,
+              t.title,
+              t.status,
+              t.priority,
+              t.created_at AS createdAt,
+              t.updated_at AS updatedAt,
+              p.id AS projectId,
+              p.slug AS projectSlug,
+              p.name AS projectName,
+              COALESCE(group_concat(tl.label_id), '') AS labelIds
+            FROM tickets t
+            INNER JOIN projects p ON p.id = t.project_id
+            LEFT JOIN ticket_labels tl ON tl.ticket_id = t.id
+            ${whereClause}
+            GROUP BY t.id
+            ORDER BY ${orderByClause}
+          `
         )
         .all(...params) as TicketRow[];
 
       return rows.map(mapTicketSummary);
     },
 
-    getTicket(id: number): Ticket | null {
-      const row = db
-        .prepare(
-          `
-          SELECT
-            t.id,
-            t.ticket_number AS ticketNumber,
-            t.title,
-            t.description,
-            t.source,
-            t.external_ref AS externalRef,
-            t.status,
-            t.priority,
-            t.created_at AS createdAt,
-            t.updated_at AS updatedAt,
-            COALESCE(group_concat(tl.label_id), '') AS labelIds
-          FROM tickets t
-          LEFT JOIN ticket_labels tl ON tl.ticket_id = t.id
-          WHERE t.id = ?
-          GROUP BY t.id
-        `
-        )
-        .get(id) as TicketRow | undefined;
-
+    getTicket(id: number, options: { project?: string } = {}): Ticket | null {
+      const row = getTicketRow(id, options.project);
       return row ? mapTicket(row) : null;
     },
 
-    getTicketDetail(id: number): TicketDetail | null {
-      const row = db
-        .prepare(
-          `
-          SELECT
-            t.id,
-            t.ticket_number AS ticketNumber,
-            t.title,
-            t.description,
-            t.source,
-            t.external_ref AS externalRef,
-            t.status,
-            t.priority,
-            t.created_at AS createdAt,
-            t.updated_at AS updatedAt,
-            COALESCE(group_concat(tl.label_id), '') AS labelIds
-          FROM tickets t
-          LEFT JOIN ticket_labels tl ON tl.ticket_id = t.id
-          WHERE t.id = ?
-          GROUP BY t.id
-        `
-        )
-        .get(id) as TicketRow | undefined;
-
+    getTicketDetail(id: number, options: { project?: string } = {}): TicketDetail | null {
+      const row = getTicketRow(id, options.project);
       return row ? mapTicketDetail(row, listTicketNotes(id)) : null;
     },
 
     createTicket(
       input: TicketInput,
-      meta: { source?: string; externalRef?: string | null } = {}
+      meta: { source?: string; externalRef?: string | null; project?: string } = {}
     ): Ticket {
       const data = ticketInputSchema.parse(input);
       assertLabelIdsExist(data.labelIds);
+      const project = requireProject(meta.project);
       const source = meta.source?.trim() || "app";
       const externalRef = meta.externalRef?.trim() || null;
-
       const createdAt = nowTimestamp();
+
       const runInsert = db.transaction((payload: TicketInput) => {
+        initializeTicketSequence.run(project.id, project.id);
+        const sequenceRow = reserveTicketNumber.get(project.id) as { ticketNumber: number } | undefined;
+
+        if (!sequenceRow) {
+          throw new Error("Unable to allocate ticket number.");
+        }
+
         const result = insertTicket.run({
+          projectId: project.id,
+          ticketNumber: `${TICKET_NUMBER_PREFIX}-${sequenceRow.ticketNumber}`,
           ...payload,
           source,
           externalRef,
@@ -505,7 +968,6 @@ export function createRepository(db: SQLiteDatabase) {
         });
 
         const ticketId = Number(result.lastInsertRowid);
-        updateTicketNumber.run(`APP-${ticketId}`, ticketId);
         replaceTicketLabels(ticketId, payload.labelIds);
         return ticketId;
       });
@@ -514,7 +976,12 @@ export function createRepository(db: SQLiteDatabase) {
       return this.getTicket(ticketId)!;
     },
 
-    updateTicket(id: number, input: TicketInput): Ticket | null {
+    updateTicket(id: number, input: TicketInput, options: { project?: string } = {}): Ticket | null {
+      const current = this.getTicket(id, options);
+      if (!current) {
+        return null;
+      }
+
       const data = ticketInputSchema.parse(input);
       assertLabelIdsExist(data.labelIds);
 
@@ -537,8 +1004,12 @@ export function createRepository(db: SQLiteDatabase) {
       return ticketId ? this.getTicket(ticketId) : null;
     },
 
-    patchTicket(id: number, input: Partial<TicketInput>): Ticket | null {
-      const current = this.getTicket(id);
+    patchTicket(
+      id: number,
+      input: Partial<TicketInput>,
+      options: { project?: string } = {}
+    ): Ticket | null {
+      const current = this.getTicket(id, options);
 
       if (!current) {
         return null;
@@ -552,51 +1023,61 @@ export function createRepository(db: SQLiteDatabase) {
         labelIds: input.labelIds ?? current.labelIds
       });
 
-      return this.updateTicket(id, next);
+      return this.updateTicket(id, next, options);
     },
 
-    getTicketByExternalRef(source: string, externalRef: string): TicketDetail | null {
+    getTicketByExternalRef(
+      source: string,
+      externalRef: string,
+      projectSlug?: string
+    ): TicketDetail | null {
+      const project = requireProject(projectSlug);
       const row = db
         .prepare(
           `
-          SELECT
-            t.id,
-            t.ticket_number AS ticketNumber,
-            t.title,
-            t.description,
-            t.source,
-            t.external_ref AS externalRef,
-            t.status,
-            t.priority,
-            t.created_at AS createdAt,
-            t.updated_at AS updatedAt,
-            COALESCE(group_concat(tl.label_id), '') AS labelIds
-          FROM tickets t
-          LEFT JOIN ticket_labels tl ON tl.ticket_id = t.id
-          WHERE t.source = ? AND t.external_ref = ?
-          GROUP BY t.id
-        `
+            SELECT
+              t.id,
+              t.ticket_number AS ticketNumber,
+              t.title,
+              t.description,
+              t.source,
+              t.external_ref AS externalRef,
+              t.status,
+              t.priority,
+              t.created_at AS createdAt,
+              t.updated_at AS updatedAt,
+              p.id AS projectId,
+              p.slug AS projectSlug,
+              p.name AS projectName,
+              COALESCE(group_concat(tl.label_id), '') AS labelIds
+            FROM tickets t
+            INNER JOIN projects p ON p.id = t.project_id
+            LEFT JOIN ticket_labels tl ON tl.ticket_id = t.id
+            WHERE t.project_id = ? AND t.source = ? AND t.external_ref = ?
+            GROUP BY t.id
+          `
         )
-        .get(source, externalRef) as TicketRow | undefined;
+        .get(project.id, source, externalRef) as TicketRow | undefined;
 
       return row ? mapTicketDetail(row, listTicketNotes(row.id)) : null;
     },
 
     createOrGetTicketByExternalRef(
       input: TicketInput,
-      meta: { source: string; externalRef?: string | null }
+      meta: { source: string; externalRef?: string | null; project?: string }
     ): { ticket: TicketDetail; created: boolean } {
+      const project = requireProject(meta.project);
       const source = meta.source.trim() || "agent";
       const externalRef = meta.externalRef?.trim() || null;
 
       if (externalRef) {
-        const existing = this.getTicketByExternalRef(source, externalRef);
+        const existing = this.getTicketByExternalRef(source, externalRef, project.slug);
         if (existing) {
           return { ticket: existing, created: false };
         }
       }
 
-      const created = this.createTicket(input, { source, externalRef });
+      const created = this.createTicket(input, { source, externalRef, project: project.slug });
       return {
         ticket: this.getTicketDetail(created.id)!,
         created: true
@@ -609,9 +1090,10 @@ export function createRepository(db: SQLiteDatabase) {
 
     createTicketNote(
       ticketId: number,
-      input: { body: string; authorName: string; authorType: TicketActorType }
+      input: { body: string; authorName: string; authorType: TicketActorType },
+      options: { project?: string } = {}
     ): TicketNote | null {
-      const ticket = this.getTicket(ticketId);
+      const ticket = this.getTicket(ticketId, options);
 
       if (!ticket) {
         return null;
@@ -624,25 +1106,35 @@ export function createRepository(db: SQLiteDatabase) {
         ...data,
         createdAt
       });
+      touchTicketRecord.run(createdAt, ticketId);
 
       return db
         .prepare(
           `
-          SELECT
-            id,
-            ticket_id AS ticketId,
-            body,
-            author_name AS authorName,
-            author_type AS authorType,
-            created_at AS createdAt
-          FROM ticket_notes
-          WHERE id = ?
-        `
+            SELECT
+              id,
+              ticket_id AS ticketId,
+              body,
+              author_name AS authorName,
+              author_type AS authorType,
+              created_at AS createdAt
+            FROM ticket_notes
+            WHERE id = ?
+          `
         )
         .get(result.lastInsertRowid) as TicketNote;
     },
 
-    deleteTicket(id: number): boolean {
+    deleteTicket(id: number, options: { project?: string } = {}): boolean {
+      if (options.project && !resolveProjectGuard(options.project)) {
+        return false;
+      }
+
+      const ticket = this.getTicket(id, options);
+      if (!ticket) {
+        return false;
+      }
+
       const result = db.prepare("DELETE FROM tickets WHERE id = ?").run(id);
       return result.changes > 0;
     },

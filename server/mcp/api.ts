@@ -1,10 +1,21 @@
-import { type Label, type TicketActorType, type TicketDetail, type TicketNote, type TicketPriority, type TicketSortOption, type TicketStatus, type TicketSummary } from "../../shared/types.js";
+import {
+  type Label,
+  type Project,
+  type TicketActorType,
+  type TicketDetail,
+  type TicketNote,
+  type TicketPriority,
+  type TicketSortOption,
+  type TicketStatus,
+  type TicketSummary
+} from "../../shared/types.js";
 
 export interface RelayMcpClientOptions {
   apiBaseUrl?: string;
 }
 
 export interface RelayTicketFilters {
+  project?: string;
   status?: TicketStatus;
   priority?: TicketPriority;
   sort?: TicketSortOption;
@@ -15,6 +26,7 @@ export interface RelayTicketFilters {
 }
 
 export interface RelayCreateTicketInput {
+  project: string;
   title: string;
   description?: string;
   status?: TicketStatus;
@@ -28,6 +40,7 @@ export interface RelayCreateTicketInput {
 
 export interface RelayUpdateTicketInput {
   id: number;
+  project?: string;
   title?: string;
   description?: string;
   status?: TicketStatus;
@@ -37,11 +50,22 @@ export interface RelayUpdateTicketInput {
   actorName?: string;
 }
 
+export interface RelayGetTicketInput {
+  id: number;
+  project?: string;
+}
+
 export interface RelayAddTicketNoteInput {
   id: number;
+  project?: string;
   body: string;
   authorName?: string;
   authorType?: TicketActorType;
+}
+
+export interface RelayDeleteTicketInput {
+  id: number;
+  project?: string;
 }
 
 export interface RelayCreateTicketResult {
@@ -137,6 +161,10 @@ export function createRelayMcpClient(options: RelayMcpClientOptions = {}) {
       return apiBaseUrl;
     },
 
+    async listProjects(): Promise<Project[]> {
+      return requestJson<Project[]>(buildUrl(apiBaseUrl, "/projects"));
+    },
+
     async listLabels(): Promise<Label[]> {
       return requestJson<Label[]>(buildUrl(appBaseUrl.toString().replace(/\/$/, ""), "/labels"));
     },
@@ -144,6 +172,7 @@ export function createRelayMcpClient(options: RelayMcpClientOptions = {}) {
     async listTickets(filters: RelayTicketFilters = {}): Promise<TicketSummary[]> {
       return requestJson<TicketSummary[]>(
         buildUrl(apiBaseUrl, "/tickets", {
+          project: filters.project,
           status: filters.status,
           priority: filters.priority,
           sort: filters.sort,
@@ -155,8 +184,11 @@ export function createRelayMcpClient(options: RelayMcpClientOptions = {}) {
       );
     },
 
-    async getTicket(id: number): Promise<TicketDetail> {
-      return requestJson<TicketDetail>(buildUrl(apiBaseUrl, `/tickets/${id}`));
+    async getTicket(input: number | RelayGetTicketInput): Promise<TicketDetail> {
+      const ticket = typeof input === "number" ? { id: input } : input;
+      return requestJson<TicketDetail>(
+        buildUrl(apiBaseUrl, `/tickets/${ticket.id}`, { project: ticket.project })
+      );
     },
 
     async createTicket(input: RelayCreateTicketInput): Promise<RelayCreateTicketResult> {
@@ -167,23 +199,27 @@ export function createRelayMcpClient(options: RelayMcpClientOptions = {}) {
     },
 
     async updateTicket(input: RelayUpdateTicketInput): Promise<TicketDetail> {
-      const { id, ...payload } = input;
-      return requestJson<TicketDetail>(buildUrl(apiBaseUrl, `/tickets/${id}`), {
+      const { id, project, ...payload } = input;
+      return requestJson<TicketDetail>(buildUrl(apiBaseUrl, `/tickets/${id}`, { project }), {
         method: "PATCH",
         body: JSON.stringify(payload)
       });
     },
 
     async addTicketNote(input: RelayAddTicketNoteInput): Promise<TicketNote> {
-      const { id, ...payload } = input;
-      return requestJson<TicketNote>(buildUrl(apiBaseUrl, `/tickets/${id}/notes`), {
-        method: "POST",
-        body: JSON.stringify(payload)
-      });
+      const { id, project, ...payload } = input;
+      return requestJson<TicketNote>(
+        buildUrl(apiBaseUrl, `/tickets/${id}/notes`, { project }),
+        {
+          method: "POST",
+          body: JSON.stringify(payload)
+        }
+      );
     },
 
-    async deleteTicket(id: number): Promise<void> {
-      await requestVoid(buildUrl(apiBaseUrl, `/tickets/${id}`), {
+    async deleteTicket(input: number | RelayDeleteTicketInput): Promise<void> {
+      const ticket = typeof input === "number" ? { id: input } : input;
+      await requestVoid(buildUrl(apiBaseUrl, `/tickets/${ticket.id}`, { project: ticket.project }), {
         method: "DELETE"
       });
     }

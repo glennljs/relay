@@ -49,10 +49,14 @@ describe("relay MCP API client", () => {
   it("accepts an origin-only RELAY_API_URL", async () => {
     const client = createRelayMcpClient({ apiBaseUrl: origin });
 
+    const projects = await client.listProjects();
+    expect(projects).toEqual(expect.arrayContaining([expect.objectContaining({ slug: "default" })]));
+
     const labels = await client.listLabels();
     expect(labels.length).toBeGreaterThan(0);
 
     const created = await client.createTicket({
+      project: "default",
       title: "Origin-only API base",
       source: "mcp-api-test",
       externalRef: "origin-only"
@@ -61,18 +65,31 @@ describe("relay MCP API client", () => {
     expect(created.created).toBe(true);
 
     const listed = await client.listTickets({
+      project: "default",
       source: "mcp-api-test",
       externalRef: "origin-only"
     });
 
     expect(listed).toHaveLength(1);
     expect(listed[0].ticketNumber).toBe("APP-1");
+
+    repository.createProject({ name: "Second Project", slug: "second-project" });
+
+    const secondCreated = await client.createTicket({
+      project: "second-project",
+      title: "Origin-only API base, second project",
+      source: "mcp-api-test",
+      externalRef: "origin-only-second"
+    });
+
+    expect(secondCreated.ticket.ticketNumber).toBe("APP-1");
   });
 
   it("accepts an /api RELAY_API_URL", async () => {
     const client = createRelayMcpClient({ apiBaseUrl: `${origin}/api` });
 
     const created = await client.createTicket({
+      project: "default",
       title: "API path base",
       source: "mcp-api-test",
       externalRef: "api-base"
@@ -80,7 +97,7 @@ describe("relay MCP API client", () => {
 
     expect(created.created).toBe(true);
 
-    const ticket = await client.getTicket(created.ticket.id);
+    const ticket = await client.getTicket({ id: created.ticket.id, project: "default" });
     expect(ticket.externalRef).toBe("api-base");
   });
 
@@ -88,13 +105,16 @@ describe("relay MCP API client", () => {
     const client = createRelayMcpClient({ apiBaseUrl: origin });
 
     const created = await client.createTicket({
+      project: "default",
       title: "Delete from MCP client",
       source: "mcp-api-test",
       externalRef: "delete-case"
     });
 
-    await client.deleteTicket(created.ticket.id);
+    await client.deleteTicket({ id: created.ticket.id, project: "default" });
 
-    await expect(client.getTicket(created.ticket.id)).rejects.toThrow("Ticket not found.");
+    await expect(client.getTicket({ id: created.ticket.id, project: "default" })).rejects.toThrow(
+      "Ticket not found."
+    );
   });
 });

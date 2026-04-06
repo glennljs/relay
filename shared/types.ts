@@ -27,6 +27,19 @@ export type TicketPriority = (typeof ticketPriorities)[number];
 export type TicketSortOption = (typeof ticketSortOptions)[number];
 export type TicketActorType = (typeof ticketActorTypes)[number];
 
+export interface Project {
+  id: number;
+  name: string;
+  slug: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProjectInput {
+  name: string;
+  slug?: string;
+}
+
 export interface Label {
   id: number;
   name: string;
@@ -41,6 +54,9 @@ export interface TicketSummary {
   priority: TicketPriority;
   updatedAt: string;
   createdAt: string;
+  projectId: number;
+  projectSlug: string;
+  projectName: string;
   labelIds: number[];
 }
 
@@ -63,12 +79,26 @@ export interface TicketDetail extends Ticket {
   notes: TicketNote[];
 }
 
+export interface TicketNoteInput {
+  body: string;
+  authorName?: string;
+  authorType?: TicketActorType;
+}
+
 export interface TicketInput {
   title: string;
   description: string;
   status: TicketStatus;
   priority: TicketPriority;
   labelIds: number[];
+}
+
+export interface TicketPatchInput {
+  title?: string;
+  description?: string;
+  status?: TicketStatus;
+  priority?: TicketPriority;
+  labelIds?: number[];
 }
 
 export interface LabelInput {
@@ -82,6 +112,7 @@ export interface TicketQuery {
   sort?: TicketSortOption;
   label?: number;
   q?: string;
+  project?: string;
   source?: string;
   externalRef?: string;
 }

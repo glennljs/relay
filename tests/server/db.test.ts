@@ -23,6 +23,9 @@ describe("database repository", () => {
     const labels = repository.listLabels();
     expect(labels).toHaveLength(3);
     expect(labels.map((label) => label.name)).toContain("Platform");
+    expect(repository.listProjects()).toEqual(
+      expect.arrayContaining([expect.objectContaining({ slug: "default" })])
+    );
   });
 
   it("persists ticket-label joins", () => {
@@ -89,6 +92,79 @@ describe("database repository", () => {
 
     expect(created.ticketNumber).toBe("APP-1");
     expect(repository.getTicketDetail(created.id)?.source).toBe("app");
+    expect(repository.getTicketDetail(created.id)?.projectSlug).toBe("default");
+
+    const project = repository.createProject({ name: "Docs", slug: "docs" });
+    const projectTicket = repository.createTicket(
+      {
+        title: "Migrated project ticket",
+        description: "",
+        status: "backlog",
+        priority: "medium",
+        labelIds: []
+      },
+      { project: project.slug }
+    );
+
+    expect(projectTicket.ticketNumber).toBe("APP-1");
+  });
+
+  it("creates projects and scopes ticket queries by project", () => {
+    const project = repository.createProject({ name: "Docs", slug: "docs" });
+
+    const defaultTicket = repository.createTicket({
+      title: "Default project ticket",
+      description: "",
+      status: "todo",
+      priority: "medium",
+      labelIds: []
+    });
+    const docsTicket = repository.createTicket(
+      {
+        title: "Docs ticket",
+        description: "",
+        status: "todo",
+        priority: "medium",
+        labelIds: []
+      },
+      { project: project.slug }
+    );
+
+    expect(defaultTicket.ticketNumber).toBe("APP-1");
+    expect(docsTicket.ticketNumber).toBe("APP-1");
+    expect(repository.listTickets({ project: "default" }).map((ticket) => ticket.id)).toEqual([
+      defaultTicket.id
+    ]);
+    expect(repository.listTickets({ project: "docs" }).map((ticket) => ticket.id)).toEqual([
+      docsTicket.id
+    ]);
+  });
+
+  it("rejects duplicate project slugs", () => {
+    repository.createProject({ name: "Docs", slug: "docs" });
+    expect(() => repository.createProject({ name: "Docs Again", slug: "docs" })).toThrow(
+      "Project slug already exists."
+    );
+  });
+
+  it("updates project names and slugs without losing ticket associations", () => {
+    const project = repository.createProject({ name: "Docs", slug: "docs" });
+    const ticket = repository.createTicket(
+      {
+        title: "Docs ticket",
+        description: "",
+        status: "todo",
+        priority: "medium",
+        labelIds: []
+      },
+      { project: "docs" }
+    );
+
+    const updated = repository.updateProject(project.id, { name: "Guides", slug: "guides" });
+
+    expect(updated).toEqual(expect.objectContaining({ id: project.id, name: "Guides", slug: "guides" }));
+    expect(repository.getProjectBySlug("docs")).toBeNull();
+    expect(repository.listTickets({ project: "guides" }).map((item) => item.id)).toEqual([ticket.id]);
   });
 
   it("sorts listed tickets by priority when requested", () => {

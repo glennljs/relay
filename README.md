@@ -2,13 +2,15 @@
 
 Relay Tasks is a local-first ticket tracker inspired by Linear.
 It runs on `localhost`, stores its data in SQLite, and keeps the workflow simple.
+It supports list and Kanban board views, ticket notes, and multiple project workspaces.
 It is built for solo developers who want a lightweight backlog they can manage themselves or connect to agents.
 Run it with `npm install` and `npm run dev`.
 
 ## What This Is
 
 - A personal issue tracker for local development work.
-- A small ticket system with labels, status, priority, search, and filtering.
+- A small ticket system with labels, status, priority, search, filtering, and ticket notes.
+- A project-scoped workspace with list and Kanban views.
 - A local app with both a human UI and an agent-friendly API.
 
 ## Why I Built It
@@ -16,6 +18,13 @@ Run it with `npm install` and `npm run dev`.
 I wanted a tracking tool that stayed local, felt lightweight, and did not assume a full team workflow.
 I also wanted something agents could use directly to open tickets, update work, and leave notes without adding a hosted service to the stack.
 This is meant to stay simple for solo development, not to become a full project management platform.
+
+## Workflow Features
+
+- Ticket notes for progress updates, handoff context, and local audit history.
+- Toggle between list and Kanban board views depending on how you want to work.
+- Multiple projects with their own slugs, scoped ticket queries, and project switching from the UI.
+- Project configuration for creating workspaces and renaming existing ones.
 
 ## What It Includes
 
@@ -49,15 +58,18 @@ npm start
 
 - SQLite database path: `data/app.db`
 - The schema is created automatically on first boot.
+- A default project is created automatically, and additional projects can be added from the UI or API.
 - A few starter labels are seeded only when the labels table is empty.
+- Every ticket belongs to a project and includes `projectId`, `projectSlug`, and `projectName`.
 - Agent-created tickets can store a `source`, an `externalRef`, and ticket notes for audit history.
 
 ## Public Agent API
 
 The server exposes a machine-facing API at `http://localhost:3000/api/public/v1`.
 
+- List projects: `GET /api/public/v1/projects`
 - OpenAPI document: `GET /api/public/v1/openapi.json`
-- Supported flows: list tickets, create tickets idempotently with `source` + `externalRef`, fetch ticket details, patch ticket fields, and append notes
+- Supported flows: list projects, list tickets by project, create tickets in a project idempotently with `source` + `externalRef`, fetch ticket details, patch or delete ticket fields, and append notes
 
 Example ticket creation:
 
@@ -65,6 +77,7 @@ Example ticket creation:
 curl -X POST http://localhost:3000/api/public/v1/tickets \
   -H "Content-Type: application/json" \
   -d '{
+    "project": "default",
     "title": "Investigate sync failure",
     "description": "Triggered from CI pipeline",
     "priority": "high",
@@ -78,12 +91,24 @@ curl -X POST http://localhost:3000/api/public/v1/tickets \
 Example handling update:
 
 ```bash
-curl -X PATCH http://localhost:3000/api/public/v1/tickets/1 \
+curl -X PATCH "http://localhost:3000/api/public/v1/tickets/1?project=default" \
   -H "Content-Type: application/json" \
   -d '{
     "status": "in_progress",
     "note": "Picked up by the triage agent.",
     "actorName": "Triage Bot"
+  }'
+```
+
+Example adding a ticket note:
+
+```bash
+curl -X POST "http://localhost:3000/api/public/v1/tickets/1/notes?project=default" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "body": "QA passed locally. Ready for review.",
+    "actorName": "Local Agent",
+    "actorType": "agent"
   }'
 ```
 
@@ -98,6 +123,7 @@ This repo also includes a local MCP server that wraps the Relay ticket API and e
 
 Available tools:
 
+- `relay_list_projects`
 - `relay_list_labels`
 - `relay_list_tickets`
 - `relay_get_ticket`

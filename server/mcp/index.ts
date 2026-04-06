@@ -32,6 +32,35 @@ export function createRelayMcpServer() {
   );
 
   server.registerTool(
+    "relay_list_projects",
+    {
+      title: "List Relay Projects",
+      description: "List the projects available in the Relay Tasks app.",
+      inputSchema: z.object({}),
+      outputSchema: z.object({
+        projects: z.array(
+          z.object({
+            id: z.number(),
+            name: z.string(),
+            slug: z.string(),
+            createdAt: z.string(),
+            updatedAt: z.string()
+          })
+        )
+      })
+    },
+    async () => {
+      const projects = await relay.listProjects();
+      const summary =
+        projects.length > 0
+          ? projects.map((project) => `${project.slug}: ${project.name}`).join("\n")
+          : "No projects found.";
+
+      return textResult(summary, { projects });
+    }
+  );
+
+  server.registerTool(
     "relay_list_labels",
     {
       title: "List Relay Labels",
@@ -64,6 +93,7 @@ export function createRelayMcpServer() {
       title: "List Relay Tickets",
       description: "Search or filter tickets in the Relay Tasks app.",
       inputSchema: z.object({
+        project: z.string().trim().min(1).optional(),
         status: z.enum(ticketStatuses).optional(),
         priority: z.enum(ticketPriorities).optional(),
         sort: z.enum(ticketSortOptions).optional(),
@@ -82,6 +112,9 @@ export function createRelayMcpServer() {
             priority: z.enum(ticketPriorities),
             createdAt: z.string(),
             updatedAt: z.string(),
+            projectId: z.number(),
+            projectSlug: z.string(),
+            projectName: z.string(),
             labelIds: z.array(z.number())
           })
         )
@@ -93,7 +126,7 @@ export function createRelayMcpServer() {
         tickets.length > 0
           ? tickets
               .map((ticket) =>
-                summarizeTicket(ticket.ticketNumber, ticket.title, ticket.status, ticket.priority)
+                `${summarizeTicket(ticket.ticketNumber, ticket.title, ticket.status, ticket.priority)} @${ticket.projectSlug}`
               )
               .join("\n")
           : "No tickets found.";
@@ -108,7 +141,8 @@ export function createRelayMcpServer() {
       title: "Get Relay Ticket",
       description: "Fetch a ticket with its notes from the Relay Tasks app.",
       inputSchema: z.object({
-        id: z.number().int().positive()
+        id: z.number().int().positive(),
+        project: z.string().trim().min(1).optional()
       }),
       outputSchema: z.object({
         ticket: z.object({
@@ -120,6 +154,9 @@ export function createRelayMcpServer() {
           priority: z.enum(ticketPriorities),
           createdAt: z.string(),
           updatedAt: z.string(),
+          projectId: z.number(),
+          projectSlug: z.string(),
+          projectName: z.string(),
           labelIds: z.array(z.number()),
           source: z.string(),
           externalRef: z.string().nullable(),
@@ -136,12 +173,12 @@ export function createRelayMcpServer() {
         })
       })
     },
-    async ({ id }) => {
-      const ticket = await relay.getTicket(id);
+    async (input) => {
+      const ticket = await relay.getTicket(input);
       const noteSummary = ticket.notes.length > 0 ? `${ticket.notes.length} notes` : "no notes";
 
       return textResult(
-        `${summarizeTicket(ticket.ticketNumber, ticket.title, ticket.status, ticket.priority)}; ${noteSummary}`,
+        `${summarizeTicket(ticket.ticketNumber, ticket.title, ticket.status, ticket.priority)} @${ticket.projectSlug}; ${noteSummary}`,
         { ticket }
       );
     }
@@ -152,8 +189,9 @@ export function createRelayMcpServer() {
     {
       title: "Create Relay Ticket",
       description:
-        "Create a ticket in Relay Tasks. When source and externalRef are both provided, creation is idempotent.",
+        "Create a ticket in Relay Tasks. When project, source, and externalRef are provided, creation is idempotent within that project.",
       inputSchema: z.object({
+        project: z.string().trim().min(1).max(80),
         title: z.string().trim().min(1).max(140),
         description: z.string().trim().max(5000).optional(),
         status: z.enum(ticketStatuses).optional(),
@@ -175,6 +213,9 @@ export function createRelayMcpServer() {
           priority: z.enum(ticketPriorities),
           createdAt: z.string(),
           updatedAt: z.string(),
+          projectId: z.number(),
+          projectSlug: z.string(),
+          projectName: z.string(),
           labelIds: z.array(z.number()),
           source: z.string(),
           externalRef: z.string().nullable(),
@@ -201,7 +242,7 @@ export function createRelayMcpServer() {
           result.ticket.title,
           result.ticket.status,
           result.ticket.priority
-        )}`,
+        )} @${result.ticket.projectSlug}`,
         result
       );
     }
@@ -215,6 +256,7 @@ export function createRelayMcpServer() {
         "Update ticket fields and optionally append an agent note in the Relay Tasks app.",
       inputSchema: z.object({
         id: z.number().int().positive(),
+        project: z.string().trim().min(1).optional(),
         title: z.string().trim().min(1).max(140).optional(),
         description: z.string().trim().max(5000).optional(),
         status: z.enum(ticketStatuses).optional(),
@@ -233,6 +275,9 @@ export function createRelayMcpServer() {
           priority: z.enum(ticketPriorities),
           createdAt: z.string(),
           updatedAt: z.string(),
+          projectId: z.number(),
+          projectSlug: z.string(),
+          projectName: z.string(),
           labelIds: z.array(z.number()),
           source: z.string(),
           externalRef: z.string().nullable(),
@@ -253,7 +298,7 @@ export function createRelayMcpServer() {
       const ticket = await relay.updateTicket(input);
 
       return textResult(
-        `Updated ${summarizeTicket(ticket.ticketNumber, ticket.title, ticket.status, ticket.priority)}`,
+        `Updated ${summarizeTicket(ticket.ticketNumber, ticket.title, ticket.status, ticket.priority)} @${ticket.projectSlug}`,
         { ticket }
       );
     }
@@ -263,9 +308,10 @@ export function createRelayMcpServer() {
     "relay_add_ticket_note",
     {
       title: "Add Relay Ticket Note",
-      description: "Append a note to a Relay ticket.",
+      description: "Append a note to a ticket in the Relay Tasks app.",
       inputSchema: z.object({
         id: z.number().int().positive(),
+        project: z.string().trim().min(1).optional(),
         body: z.string().trim().min(1).max(4000),
         authorName: z.string().trim().min(1).max(80).optional(),
         authorType: z.enum(ticketActorTypes).optional()
@@ -283,7 +329,7 @@ export function createRelayMcpServer() {
     },
     async (input) => {
       const note = await relay.addTicketNote(input);
-      return textResult(`Added note to ticket ${note.ticketId}.`, { note });
+      return textResult(`Added note to ticket ${note.ticketId}`, { note });
     }
   );
 
@@ -293,16 +339,17 @@ export function createRelayMcpServer() {
       title: "Delete Relay Ticket",
       description: "Delete a ticket from the Relay Tasks app.",
       inputSchema: z.object({
-        id: z.number().int().positive()
+        id: z.number().int().positive(),
+        project: z.string().trim().min(1).optional()
       }),
       outputSchema: z.object({
-        deleted: z.literal(true),
+        deleted: z.boolean(),
         id: z.number()
       })
     },
-    async ({ id }) => {
-      await relay.deleteTicket(id);
-      return textResult(`Deleted ticket ${id}.`, { deleted: true, id });
+    async (input) => {
+      await relay.deleteTicket(input);
+      return textResult(`Deleted ticket ${input.id}`, { deleted: true, id: input.id });
     }
   );
 

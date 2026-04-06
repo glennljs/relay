@@ -53,6 +53,8 @@ describe("relay MCP server", () => {
   });
 
   it("exposes Relay ticket tools over MCP stdio", async () => {
+    repository.createProject({ name: "Second Project", slug: "second-project" });
+
     const client = new Client({
       name: "relay-mcp-test",
       version: "0.1.0"
@@ -75,6 +77,7 @@ describe("relay MCP server", () => {
       const { tools } = await client.listTools();
       expect(tools.map((tool) => tool.name)).toEqual(
         expect.arrayContaining([
+          "relay_list_projects",
           "relay_list_labels",
           "relay_list_tickets",
           "relay_get_ticket",
@@ -85,9 +88,23 @@ describe("relay MCP server", () => {
         ])
       );
 
+      const projectsResult = await client.callTool({
+        name: "relay_list_projects",
+        arguments: {}
+      });
+
+      const projects = projectsResult.structuredContent as {
+        projects: Array<{ slug: string }>;
+      };
+
+      expect(projects.projects).toEqual(
+        expect.arrayContaining([expect.objectContaining({ slug: "default" })])
+      );
+
       const createResult = await client.callTool({
         name: "relay_create_ticket",
         arguments: {
+          project: "default",
           title: "Agent opened ticket",
           description: "Created through the MCP server.",
           source: "mcp-test",
@@ -106,10 +123,32 @@ describe("relay MCP server", () => {
       expect(created.ticket.ticketNumber).toBe("APP-1");
       expect(created.ticket.notes).toHaveLength(1);
 
+      const secondCreateResult = await client.callTool({
+        name: "relay_create_ticket",
+        arguments: {
+          project: "second-project",
+          title: "Agent opened second project ticket",
+          description: "Created through the MCP server.",
+          source: "mcp-test",
+          externalRef: "case-2",
+          note: "Initial note for the second project.",
+          actorName: "Test Agent"
+        }
+      });
+
+      const secondCreated = secondCreateResult.structuredContent as {
+        created: boolean;
+        ticket: { id: number; ticketNumber: string };
+      };
+
+      expect(secondCreated.created).toBe(true);
+      expect(secondCreated.ticket.ticketNumber).toBe("APP-1");
+
       const updateResult = await client.callTool({
         name: "relay_update_ticket",
         arguments: {
           id: created.ticket.id,
+          project: "default",
           status: "in_progress",
           note: "Working on it.",
           actorName: "Test Agent"
@@ -126,6 +165,7 @@ describe("relay MCP server", () => {
       const listResult = await client.callTool({
         name: "relay_list_tickets",
         arguments: {
+          project: "default",
           source: "mcp-test",
           externalRef: "case-1"
         }
@@ -141,7 +181,8 @@ describe("relay MCP server", () => {
       const deleteResult = await client.callTool({
         name: "relay_delete_ticket",
         arguments: {
-          id: created.ticket.id
+          id: created.ticket.id,
+          project: "default"
         }
       });
 
@@ -153,6 +194,7 @@ describe("relay MCP server", () => {
       const emptyListResult = await client.callTool({
         name: "relay_list_tickets",
         arguments: {
+          project: "default",
           source: "mcp-test",
           externalRef: "case-1"
         }

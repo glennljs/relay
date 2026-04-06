@@ -28,12 +28,21 @@ describe("public agent API", () => {
     await request(app).get("/api/public/v1/tickets").expect(200);
   });
 
+  it("lists available projects for agents", async () => {
+    const response = await request(app).get("/api/public/v1/projects").expect(200);
+
+    expect(response.body).toEqual(
+      expect.arrayContaining([expect.objectContaining({ slug: "default" })])
+    );
+  });
+
   it("creates tickets idempotently and records agent notes", async () => {
     const labelId = repository.listLabels()[0].id;
 
     const created = await request(app)
       .post("/api/public/v1/tickets")
       .send({
+        project: "default",
         title: "Investigate sync failure",
         description: "Agents should be able to open tickets from external systems.",
         priority: "high",
@@ -52,9 +61,28 @@ describe("public agent API", () => {
     expect(created.body.ticket.notes).toHaveLength(1);
     expect(created.body.ticket.notes[0].authorName).toBe("CI Agent");
 
+    repository.createProject({ name: "Second Project", slug: "second-project" });
+
+    const secondProjectTicket = await request(app)
+      .post("/api/public/v1/tickets")
+      .send({
+        project: "second-project",
+        title: "Investigate sync failure elsewhere",
+        description: "",
+        priority: "high",
+        labelIds: [labelId],
+        source: "github-actions",
+        externalRef: "run-4422",
+        actorName: "CI Agent"
+      })
+      .expect(201);
+
+    expect(secondProjectTicket.body.ticket.ticketNumber).toBe("APP-1");
+
     const repeated = await request(app)
       .post("/api/public/v1/tickets")
       .send({
+        project: "default",
         title: "Investigate sync failure",
         source: "github-actions",
         externalRef: "run-4421"
@@ -66,7 +94,7 @@ describe("public agent API", () => {
 
     const listed = await request(app)
       .get("/api/public/v1/tickets")
-      .query({ source: "github-actions", externalRef: "run-4421" })
+      .query({ project: "default", source: "github-actions", externalRef: "run-4421" })
       .expect(200);
 
     expect(listed.body).toHaveLength(1);
@@ -83,7 +111,7 @@ describe("public agent API", () => {
     });
 
     const noteOnly = await request(app)
-      .patch(`/api/public/v1/tickets/${created.id}`)
+      .patch(`/api/public/v1/tickets/${created.id}?project=default`)
       .send({
         note: "Picked up for investigation.",
         actorName: "Triage Bot"
@@ -94,7 +122,7 @@ describe("public agent API", () => {
     expect(noteOnly.body.notes[0].body).toContain("Picked up");
 
     const updated = await request(app)
-      .patch(`/api/public/v1/tickets/${created.id}`)
+      .patch(`/api/public/v1/tickets/${created.id}?project=default`)
       .send({
         status: "in_progress",
         priority: "high",
@@ -117,8 +145,50 @@ describe("public agent API", () => {
       labelIds: []
     });
 
-    await request(app).delete(`/api/public/v1/tickets/${created.id}`).expect(204);
-    await request(app).get(`/api/public/v1/tickets/${created.id}`).expect(404);
+    await request(app).delete(`/api/public/v1/tickets/${created.id}?project=default`).expect(204);
+    await request(app).get(`/api/public/v1/tickets/${created.id}?project=default`).expect(404);
+  });
+
+  it("scopes idempotency by project", async () => {
+    repository.createProject({ name: "Second Project", slug: "second-project" });
+
+    const first = await request(app)
+      .post("/api/public/v1/tickets")
+      .send({
+        project: "default",
+        title: "Shared external reference",
+        source: "ci",
+        externalRef: "run-100"
+      })
+      .expect(201);
+
+    const second = await request(app)
+      .post("/api/public/v1/tickets")
+      .send({
+        project: "second-project",
+        title: "Shared external reference",
+        source: "ci",
+        externalRef: "run-100"
+      })
+      .expect(201);
+
+    expect(first.body.ticket.id).not.toBe(second.body.ticket.id);
+    expect(first.body.ticket.projectSlug).toBe("default");
+    expect(second.body.ticket.projectSlug).toBe("second-project");
+  });
+
+  it("rejects unknown projects and requires project on public create", async () => {
+    await request(app)
+      .post("/api/public/v1/tickets")
+      .send({
+        title: "Missing project"
+      })
+      .expect(400);
+
+    await request(app)
+      .get("/api/public/v1/tickets")
+      .query({ project: "unknown-project" })
+      .expect(400);
   });
 
   it("exposes an OpenAPI document when authenticated", async () => {
